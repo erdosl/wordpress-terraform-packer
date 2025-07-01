@@ -1,0 +1,167 @@
+
+name: Build WordPress AMI (Self-Hosted)
+
+on:
+  workflow_dispatch: # Allows manual triggering from the GitHub UI
+
+jobs:
+  build:
+    runs-on: [self-hosted, linux, ci]
+    outputs:
+      ami_id: ${{ steps.extract_ami_id.outputs.AMI_ID }} # Expose AMI_ID as an output of this job
+      run_id: ${{ github.run_id }} # Also pass the run_id for artifact download in the deploy job
+
+    env:
+      TF_VAR_aws_region: eu-west-2
+      TF_TOKEN_app_terraform_io: ${{ secrets.TFC_TOKEN }}
+      TF_VAR_alarm_email: ${{ secrets.TF_VAR_ALARM_EMAIL }}
+      TFC_ORG_NAME: my-cloud-org
+      TFC_INFRA_WORKSPACE_ID: ws-G489yFcyZPL5bK2X
+      TFC_API_READ_TOKEN: ${{ secrets.TFC_API_READ_TOKEN }}
+
+    steps:
+      - name: Checkout Packer Code
+        uses: actions/checkout@v4
+        # Checks out the current repository (21-wordpress-packer-v4) into the runner's WORKDIR
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.1
+          cli_config_credentials_hostname: app.terraform.io
+          terraform_wrapper: true # Ensures Terraform commands are wrapped correctly
+
+      - name: Verify Terraform Path
+        run: |
+          echo "Which Terraform:"
+          which terraform
+          echo "Terraform version:"
+          terraform version
+          echo "Current PATH:"
+          echo $PATH
+
+      - name: Set up Packer
+        uses: hashicorp/setup-packer@v3
+        with:
+          version: 1.12.0 # Packer version
+      
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-region: eu-west-2
+          # Uses IAM Role attached to the self-hosted runner for authentication
+
+      - name: Ensure Python Script is Executable
+        run: chmod +x fetch_tf_outputs.py
+
+      - name: Fetch Terraform Outputs (Execute Python Script)
+        id: fetch_outputs_step
+
+        run: ./fetch_tf_outputs.py
+
+      - name: Create Packer Vars File
+        working-directory: ./packer
+        run: | # Use the standard literal block style, it's generally most compatible for 'cat <<EOF'
+          # Access outputs from the previous step using steps.<step_id>.outputs.
+          # Access job-level env vars using env.VAR_NAME.
+          # Access GitHub context using github.CONTEXT.
+          
+          cat <<EOF > github.pkrvars.hcl
+          subnet_id         = "${{ steps.fetch_outputs_step.outputs.SUBNET_ID }}"
+          security_group_id = "${{ steps.fetch_outputs_step.outputs.SG_ID }}"
+          efs_dns_name      = "${{ steps.fetch_outputs_step.outputs.EFS_DNS_NAME }}"
+          vpc_id            = "${{ steps.fetch_outputs_step.outputs.VPC_ID }}"
+          region            = "${{ env.TF_VAR_aws_region }}" # This comes from the job-level 'env' block
+          git_commit        = "${{ github.sha }}"
+          git_branch        = "${{ github.ref_name }}" # Use github.ref_name for consistency
+          git_tag           = "${{ github.ref_name }}"  # Use github.ref_name for consistency
+          environment       = "dev" # Directly set as literal
+          EOF
+          cat github.pkrvars.hcl # For debugging in logs
+
+      - name: Initialize & Build AMI
+        working-directory: ./packer
+        run: |
+          packer init wordpress.pkr.hcl
+          packer validate -var-file=github.pkrvars.hcl wordpress.pkr.hcl
+          packer build -machine-readable -var-file=github.pkrvars.hcl wordpress.pkr.hcl | tee packer.log
+
+      - name: Extract AMI ID
+        id: extract_ami_id
+        working-directory: ./packer
+        run: |
+          # Extract AMI ID from packer.log
+          AMI_ID=$(grep 'artifact,0,id' packer.log | cut -d, -f6 | cut -d: -f2)
+          if [ -z "$AMI_ID" ]; then
+            echo "Error: AMI ID not found in packer.log"
+            exit 1
+          fi
+          echo "Extracted AMI ID: $AMI_ID"
+          
+          # Create ami.auto.tfvars for the main infrastructure
+          echo "ami_id = \"$AMI_ID\"" > ../ami.auto.tfvars
+          cat ../ami.auto.tfvars # For debugging in logs
+
+          echo "AMI_ID=$AMI_ID" >> $GITHUB_OUTPUT 
+          echo "AMI_ID=$AMI_ID" >> $GITHUB_ENV # Optional
+
+      - name: Upload AMI ID Artifact (from Packer Repo)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ami-id
+          path: ami.auto.tfvars
+
+  deploy_ami:
+    runs-on: [self-hosted, linux, ci]
+    needs: build
+
+    env:
+      TF_VAR_aws_region: eu-west-2
+      TF_TOKEN_app_terraform_io: ${{ secrets.TFC_TOKEN }}
+      TF_VAR_alarm_email: ${{ vars.TF_VAR_ALARM_EMAIL }}
+      INFRA_REPO_NAME: wordpress-terraform 
+
+    steps:
+      - name: Checkout Infra Code
+        uses: actions/checkout@v4
+        with:
+          repository: erdosl/${{ env.INFRA_REPO_NAME }} 
+          path: ./infra_repo # Check out path
+          token: ${{ secrets.PAT_TOKEN }} 
+
+      - name: Download AMI ID Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ami-id
+          path: ./infra_repo
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.12.1
+          cli_config_credentials_hostname: app.terraform.io
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v3
+        with:
+          aws-region: eu-west-2
+
+      - name: Terraform Apply AMI Update to Infra
+        working-directory: ./infra_repo
+        run: |
+          echo "--- Contents of infra_repo directory: ---"
+          ls -la .
+          echo "--- Content of ami.auto.tfvars: ---"
+          cat ami.auto.tfvars # Verify the ami.auto.tfvars file is present and correct
+          
+          echo "--- Running terraform init in infra_repo ---"
+          # Use TF_CLOUD_TOKEN for HCP Terraform backend authentication
+          terraform init -no-color
+
+          echo "--- Running terraform plan in infra_repo ---"
+          # The ami.auto.tfvars will provide the 'ami_id' variable value
+          terraform plan -no-color -input=false -var-file="ami.auto.tfvars"
+
+          echo "--- Running terraform apply in infra_repo ---"
+          terraform apply -auto-approve -input=false -var-file="ami.auto.tfvars"
+          echo "--- Terraform Apply complete. Check logs for details. ---"

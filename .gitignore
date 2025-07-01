@@ -1,0 +1,10 @@
+.terraform/
+terraform.tfstate
+terraform.tfstate.*
+*.tfvars
+*.auto.tfvars
+.aws/
+*.log
+crash.log
+go.*
+test/
